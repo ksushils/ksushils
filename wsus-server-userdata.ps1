@@ -17,37 +17,44 @@ function Write-Log {
 Write-Log "Starting WSUS Server Setup..."
 
 try {
-    # Check if SQL Server is installed
-    Write-Log "Checking for existing SQL Server installation..."
-    $sqlServerInstalled = $false
-
-    try {
-        $sqlService = Get-Service -Name "MSSQL*" -ErrorAction SilentlyContinue
-        if ($sqlService) {
-            $sqlServerInstalled = $true
-            Write-Log "SQL Server detected on this system."
-        }
-    } catch {
-        Write-Log "No SQL Server detected."
-    }
-
-    # Check for SQL Server Connectivity feature
+    # Check if SQL Server Connectivity feature is already installed
+    Write-Log "Checking for SQL Server Connectivity (UpdateServices-DB) feature..."
     $sqlConnectivity = Get-WindowsFeature -Name "UpdateServices-DB" -ErrorAction SilentlyContinue
-    Write-Log "SQL Server Connectivity feature status: $($sqlConnectivity.Installed)"
+    $hasConflict = $false
+
+    if ($sqlConnectivity -and $sqlConnectivity.Installed) {
+        $hasConflict = $true
+        Write-Log "SQL Server Connectivity (UpdateServices-DB) is ALREADY INSTALLED - this will conflict with WID"
+        Write-Log "Need to remove it first before installing WSUS with WID"
+    } else {
+        Write-Log "No SQL Server Connectivity conflict detected."
+    }
 
     # Install WSUS Role with required features
     Write-Log "Installing WSUS Role and features..."
 
-    if ($sqlServerInstalled) {
-        Write-Log "SQL Server detected - installing WSUS without WID to avoid conflict..."
-        # Install only the services and management tools, not the database
-        $installResult = Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-RSAT -IncludeManagementTools
-        Write-Log "UpdateServices-Services installation result: $($installResult.Success)"
+    if ($hasConflict) {
+        Write-Log "Removing SQL Server Connectivity feature to avoid conflict..."
+        try {
+            $removeResult = Uninstall-WindowsFeature -Name "UpdateServices-DB" -ErrorAction Stop
+            Write-Log "SQL Server Connectivity removal result: $($removeResult.Success)"
 
-        # Note: We'll configure WSUS to use WID via wsusutil parameters
-        Write-Log "Will configure WSUS to use Windows Internal Database (WID) during post-install."
+            if ($removeResult.Success) {
+                Write-Log "Successfully removed SQL Server Connectivity feature"
+            } else {
+                Write-Log "WARNING: Could not remove SQL Server Connectivity"
+            }
+        } catch {
+            Write-Log "ERROR removing SQL Server Connectivity: $_"
+            Write-Log "Attempting alternative installation method..."
+        }
+
+        # Now install WSUS with WID
+        Write-Log "Installing WSUS with Windows Internal Database (WID)..."
+        $installResult = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+        Write-Log "UpdateServices installation result: $($installResult.Success)"
     } else {
-        Write-Log "No SQL Server conflict detected - installing WSUS with default database..."
+        Write-Log "No conflict detected - installing WSUS with default database..."
         # Standard installation with WID
         $installResult = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
         Write-Log "UpdateServices installation result: $($installResult.Success)"
@@ -101,20 +108,10 @@ try {
 
     # Run WSUS post-installation configuration
     Write-Log "Running WSUS post-installation configuration..."
+    Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir"
 
-    # Build the command based on SQL Server presence
     try {
-        if ($sqlServerInstalled) {
-            # Use Windows Internal Database explicitly to avoid SQL Server conflict
-            Write-Log "Using Windows Internal Database (WID) due to SQL Server presence"
-            Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir SQLINSTANCE_NAME=##WID"
-            $postInstallOutput = & "$wsusUtilPath" postinstall "CONTENT_DIR=$WSUSContentDir" "SQLINSTANCE_NAME=##WID" 2>&1
-        } else {
-            # Default installation
-            Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir"
-            $postInstallOutput = & "$wsusUtilPath" postinstall "CONTENT_DIR=$WSUSContentDir" 2>&1
-        }
-
+        $postInstallOutput = & "$wsusUtilPath" postinstall "CONTENT_DIR=$WSUSContentDir" 2>&1
         Write-Log "Post-install output: $postInstallOutput"
         Write-Log "Waiting 30 seconds for post-install to complete..."
         Start-Sleep -Seconds 30

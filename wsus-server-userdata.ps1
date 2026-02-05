@@ -1,0 +1,224 @@
+<powershell>
+# WSUS Server Setup - EC2 User Data Script
+# This script installs and configures WSUS on a Windows Server EC2 instance
+
+# Set error handling
+$ErrorActionPreference = "Stop"
+
+# Create log file
+$LogFile = "C:\wsus-setup.log"
+function Write-Log {
+    param($Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $LogFile -Append
+    Write-Host $Message
+}
+
+Write-Log "Starting WSUS Server Setup..."
+
+try {
+    # Install WSUS Role with required features
+    Write-Log "Installing WSUS Role and features..."
+    Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+    Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-DB
+
+    Write-Log "WSUS Role installed successfully."
+
+    # Create WSUS content directory
+    $WSUSContentDir = "C:\WSUS"
+    if (-not (Test-Path $WSUSContentDir)) {
+        New-Item -Path $WSUSContentDir -ItemType Directory -Force
+        Write-Log "Created WSUS content directory: $WSUSContentDir"
+    }
+
+    # Run WSUS post-installation configuration
+    Write-Log "Running WSUS post-installation configuration..."
+    & "C:\Program Files\Update Services\Tools\wsusutil.exe" postinstall CONTENT_DIR=$WSUSContentDir
+    Start-Sleep -Seconds 30
+
+    Write-Log "WSUS post-installation completed."
+
+    # Load WSUS management assembly
+    [reflection.assembly]::LoadWithPartialName("Microsoft.UpdateServices.Administration") | Out-Null
+
+    # Connect to WSUS server
+    Write-Log "Connecting to WSUS server..."
+    $WSUSServer = [Microsoft.UpdateServices.Administration.AdminProxy]::GetUpdateServer()
+
+    # Configure WSUS synchronization source (Microsoft Update)
+    Write-Log "Configuring synchronization source..."
+    $WSUSConfig = $WSUSServer.GetConfiguration()
+    $WSUSConfig.SyncFromMicrosoftUpdate = $true
+    $WSUSConfig.Save()
+
+    # Set WSUS server to use port 8530 (HTTP)
+    Write-Log "Configuring WSUS to use port 8530..."
+    $WSUSConfig.ServerId = [System.Guid]::NewGuid()
+    $WSUSConfig.Save()
+
+    # Configure products to sync (Windows Server, Windows 10/11)
+    Write-Log "Configuring products..."
+    $subscription = $WSUSServer.GetSubscription()
+    $subscription.GetCategories() | Where-Object {
+        $_.Title -eq "Windows Server 2019" -or
+        $_.Title -eq "Windows Server 2022" -or
+        $_.Title -eq "Windows Server 2016" -or
+        $_.Title -eq "Windows 10" -or
+        $_.Title -eq "Windows 11"
+    } | ForEach-Object {
+        $subscription.SetCategoryEnabled($_.Id, $true)
+        Write-Log "Enabled product: $($_.Title)"
+    }
+
+    # Configure update classifications
+    Write-Log "Configuring update classifications..."
+    $subscription.GetCategories() | Where-Object {
+        $_.Title -eq "Critical Updates" -or
+        $_.Title -eq "Security Updates" -or
+        $_.Title -eq "Definition Updates" -or
+        $_.Title -eq "Update Rollups" -or
+        $_.Title -eq "Updates"
+    } | ForEach-Object {
+        $subscription.SetCategoryEnabled($_.Id, $true)
+        Write-Log "Enabled classification: $($_.Title)"
+    }
+
+    # Set synchronization schedule (daily at 2 AM)
+    Write-Log "Setting synchronization schedule..."
+    $subscription.SynchronizeAutomatically = $true
+    $subscription.SynchronizeAutomaticallyTimeOfDay = (New-TimeSpan -Hours 2)
+    $subscription.NumberOfSynchronizationsPerDay = 1
+    $subscription.Save()
+
+    # Create computer groups for organization
+    Write-Log "Creating computer groups..."
+    $allComputers = $WSUSServer.GetComputerTargetGroups() | Where-Object { $_.Name -eq "All Computers" }
+
+    # Create groups for different server types
+    $groupNames = @("Production Servers", "Development Servers", "Test Servers")
+    foreach ($groupName in $groupNames) {
+        try {
+            $existingGroup = $WSUSServer.GetComputerTargetGroups() | Where-Object { $_.Name -eq $groupName }
+            if (-not $existingGroup) {
+                $WSUSServer.CreateComputerTargetGroup($groupName)
+                Write-Log "Created computer group: $groupName"
+            }
+        } catch {
+            Write-Log "Group may already exist or error creating: $groupName"
+        }
+    }
+
+    # Start initial synchronization
+    Write-Log "Starting initial synchronization (this may take a while)..."
+    $subscription.StartSynchronization()
+
+    # Configure Windows Firewall rules
+    Write-Log "Configuring firewall rules..."
+    New-NetFirewallRule -DisplayName "WSUS HTTP (8530)" -Direction Inbound -LocalPort 8530 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName "WSUS HTTPS (8531)" -Direction Inbound -LocalPort 8531 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+
+    Write-Log "Firewall rules configured."
+
+    # Configure automatic approval rules
+    Write-Log "Configuring automatic approval rules..."
+    try {
+        $rule = $WSUSServer.CreateInstallApprovalRule("Auto-Approve Critical and Security Updates")
+        $rule.Enabled = $true
+        $rule.Action = [Microsoft.UpdateServices.Administration.AutomaticUpdateApprovalAction]::Install
+
+        # Add classifications to auto-approve
+        $classifications = $WSUSServer.GetUpdateClassifications() | Where-Object {
+            $_.Title -eq "Critical Updates" -or $_.Title -eq "Security Updates"
+        }
+        foreach ($classification in $classifications) {
+            $rule.Classifications.Add($classification)
+        }
+
+        # Add computer groups to apply rule
+        $allGroups = $WSUSServer.GetComputerTargetGroups()
+        foreach ($group in $allGroups) {
+            $rule.ComputerTargetGroups.Add($group)
+        }
+
+        $rule.Save()
+        Write-Log "Auto-approval rule created successfully."
+    } catch {
+        Write-Log "Error creating auto-approval rule: $_"
+    }
+
+    # Set WSUS to run automatically
+    Write-Log "Configuring WSUS service to start automatically..."
+    Set-Service -Name WsusService -StartupType Automatic
+
+    # Configure IIS settings for WSUS
+    Write-Log "Configuring IIS for WSUS..."
+    Import-Module WebAdministration
+
+    # Increase max request length for client reports
+    Set-WebConfigurationProperty -PSPath "IIS:\Sites\WSUS Administration" -Filter "system.webServer/security/requestFiltering/requestLimits" -Name "maxAllowedContentLength" -Value 30000000
+
+    # Set client web service connection timeout
+    Set-WebConfigurationProperty -PSPath "IIS:\Sites\WSUS Administration" -Filter "system.web/httpRuntime" -Name "executionTimeout" -Value 7200
+
+    Write-Log "IIS configuration completed."
+
+    # Create a scheduled task to run WSUS cleanup weekly
+    Write-Log "Creating WSUS cleanup scheduled task..."
+    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -Command `"Get-WsusServer | Invoke-WsusServerCleanup -CleanupObsoleteUpdates -CleanupUnneededContentFiles -CompressUpdates -DeclineExpiredUpdates -DeclineSupersededUpdates`""
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName "WSUS Server Cleanup" -Action $action -Trigger $trigger -Principal $principal -Description "Weekly WSUS server cleanup task"
+
+    Write-Log "Scheduled task created."
+
+    # Output WSUS server information
+    Write-Log "================================"
+    Write-Log "WSUS Server Setup Complete!"
+    Write-Log "================================"
+    Write-Log "WSUS Server URL: http://$(hostname):8530"
+    Write-Log "WSUS Console: Open 'Windows Server Update Services' from Server Manager"
+    Write-Log ""
+    Write-Log "Next Steps:"
+    Write-Log "1. Configure client machines to use this WSUS server"
+    Write-Log "2. Monitor synchronization status in WSUS console"
+    Write-Log "3. Approve updates for computer groups"
+    Write-Log "================================"
+
+    # Create a summary file
+    @"
+WSUS Server Configuration Summary
+==================================
+Server: $(hostname)
+IP Address: $(Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Select-Object -First 1 -ExpandProperty IPAddress)
+WSUS URL: http://$(hostname):8530
+Content Directory: $WSUSContentDir
+Installation Date: $(Get-Date)
+
+Configuration:
+- Products: Windows Server 2016, 2019, 2022, Windows 10, 11
+- Classifications: Critical Updates, Security Updates, Definition Updates, Update Rollups, Updates
+- Synchronization: Daily at 2:00 AM
+- Auto-Approval: Enabled for Critical and Security Updates
+- Cleanup Task: Weekly on Sunday at 3:00 AM
+
+Computer Groups Created:
+- All Computers (Default)
+- Production Servers
+- Development Servers
+- Test Servers
+
+Firewall Rules:
+- TCP 8530 (HTTP) - Open
+- TCP 8531 (HTTPS) - Open
+"@ | Out-File "C:\WSUS-Configuration.txt"
+
+    Write-Log "Configuration summary saved to C:\WSUS-Configuration.txt"
+
+} catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Write-Log "Stack Trace: $($_.ScriptStackTrace)"
+    throw
+}
+
+Write-Log "Script execution completed."
+</powershell>

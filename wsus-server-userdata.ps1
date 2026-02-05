@@ -19,10 +19,18 @@ Write-Log "Starting WSUS Server Setup..."
 try {
     # Install WSUS Role with required features
     Write-Log "Installing WSUS Role and features..."
-    Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
-    Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-DB
+    $installResult = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+    Write-Log "UpdateServices installation result: $($installResult.Success)"
+
+    $installResult2 = Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-DB
+    Write-Log "UpdateServices-Services,UpdateServices-DB installation result: $($installResult2.Success)"
 
     Write-Log "WSUS Role installed successfully."
+
+    # Wait for installation to complete and check if reboot is needed
+    if ($installResult.RestartNeeded -eq 'Yes' -or $installResult2.RestartNeeded -eq 'Yes') {
+        Write-Log "WARNING: Reboot may be required after WSUS installation."
+    }
 
     # Create WSUS content directory
     $WSUSContentDir = "C:\WSUS"
@@ -31,12 +39,52 @@ try {
         Write-Log "Created WSUS content directory: $WSUSContentDir"
     }
 
+    # Wait for wsusutil.exe to become available
+    Write-Log "Waiting for WSUS binaries to become available..."
+    $wsusUtilPath = "C:\Program Files\Update Services\Tools\wsusutil.exe"
+    $maxWaitTime = 300  # 5 minutes
+    $waitInterval = 10   # 10 seconds
+    $elapsedTime = 0
+
+    while (-not (Test-Path $wsusUtilPath) -and $elapsedTime -lt $maxWaitTime) {
+        Write-Log "Waiting for wsusutil.exe... ($elapsedTime seconds elapsed)"
+        Start-Sleep -Seconds $waitInterval
+        $elapsedTime += $waitInterval
+    }
+
+    if (-not (Test-Path $wsusUtilPath)) {
+        Write-Log "ERROR: wsusutil.exe not found after waiting $maxWaitTime seconds"
+        Write-Log "Checking alternate locations..."
+
+        # Check if WSUS is installed in alternate location
+        $alternatePath = "C:\Program Files (x86)\Update Services\Tools\wsusutil.exe"
+        if (Test-Path $alternatePath) {
+            $wsusUtilPath = $alternatePath
+            Write-Log "Found wsusutil.exe at alternate location: $alternatePath"
+        } else {
+            Write-Log "ERROR: Cannot find wsusutil.exe in any expected location"
+            Write-Log "Please check WSUS installation and run post-install manually:"
+            Write-Log "  & '$wsusUtilPath' postinstall CONTENT_DIR=$WSUSContentDir"
+            throw "wsusutil.exe not found"
+        }
+    }
+
+    Write-Log "Found wsusutil.exe at: $wsusUtilPath"
+
     # Run WSUS post-installation configuration
     Write-Log "Running WSUS post-installation configuration..."
-    & "C:\Program Files\Update Services\Tools\wsusutil.exe" postinstall CONTENT_DIR=$WSUSContentDir
-    Start-Sleep -Seconds 30
+    Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir"
 
-    Write-Log "WSUS post-installation completed."
+    try {
+        $postInstallOutput = & "$wsusUtilPath" postinstall CONTENT_DIR=$WSUSContentDir 2>&1
+        Write-Log "Post-install output: $postInstallOutput"
+        Write-Log "Waiting 30 seconds for post-install to complete..."
+        Start-Sleep -Seconds 30
+        Write-Log "WSUS post-installation completed."
+    } catch {
+        Write-Log "ERROR during post-install: $_"
+        Write-Log "Attempting to continue anyway..."
+    }
 
     # Load WSUS management assembly
     [reflection.assembly]::LoadWithPartialName("Microsoft.UpdateServices.Administration") | Out-Null

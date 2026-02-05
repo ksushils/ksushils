@@ -60,11 +60,35 @@ try {
         Write-Log "UpdateServices installation result: $($installResult.Success)"
     }
 
-    Write-Log "WSUS Role installed successfully."
+    Write-Log "WSUS Role installation command completed."
+
+    # Detailed diagnostics of installation result
+    Write-Log "Installation Result Details:"
+    Write-Log "  Success: $($installResult.Success)"
+    Write-Log "  Exit Code: $($installResult.ExitCode)"
+    Write-Log "  Restart Needed: $($installResult.RestartNeeded)"
+
+    # Check what was actually installed
+    Write-Log "Verifying installed WSUS features..."
+    $installedFeatures = Get-WindowsFeature | Where-Object { $_.Name -like "UpdateServices*" -and $_.Installed }
+    foreach ($feature in $installedFeatures) {
+        Write-Log "  Installed: $($feature.Name) - $($feature.DisplayName)"
+    }
+
+    if ($installedFeatures.Count -eq 0) {
+        Write-Log "ERROR: No UpdateServices features were installed!"
+        Write-Log "Installation may have failed. Checking all available WSUS features..."
+        $allWsusFeatures = Get-WindowsFeature | Where-Object { $_.Name -like "UpdateServices*" }
+        foreach ($feature in $allWsusFeatures) {
+            Write-Log "  $($feature.Name): Installed=$($feature.Installed), InstallState=$($feature.InstallState)"
+        }
+        throw "WSUS features not installed"
+    }
 
     # Wait for installation to complete and check if reboot is needed
     if ($installResult.RestartNeeded -eq 'Yes') {
-        Write-Log "WARNING: Reboot may be required after WSUS installation."
+        Write-Log "WARNING: Reboot is required after WSUS installation."
+        Write-Log "The script will continue, but you may need to reboot and run post-install manually."
     }
 
     # Create WSUS content directory
@@ -89,18 +113,55 @@ try {
 
     if (-not (Test-Path $wsusUtilPath)) {
         Write-Log "ERROR: wsusutil.exe not found after waiting $maxWaitTime seconds"
-        Write-Log "Checking alternate locations..."
+        Write-Log "Checking alternate locations and searching entire system..."
 
-        # Check if WSUS is installed in alternate location
-        $alternatePath = "C:\Program Files (x86)\Update Services\Tools\wsusutil.exe"
-        if (Test-Path $alternatePath) {
-            $wsusUtilPath = $alternatePath
-            Write-Log "Found wsusutil.exe at alternate location: $alternatePath"
-        } else {
-            Write-Log "ERROR: Cannot find wsusutil.exe in any expected location"
-            Write-Log "Please check WSUS installation and run post-install manually:"
-            Write-Log "  & '$wsusUtilPath' postinstall CONTENT_DIR=$WSUSContentDir"
-            throw "wsusutil.exe not found"
+        # Check common alternate locations
+        $alternatePaths = @(
+            "C:\Program Files (x86)\Update Services\Tools\wsusutil.exe",
+            "C:\Windows\System32\wsusutil.exe",
+            "$env:ProgramFiles\Update Services\Tools\wsusutil.exe"
+        )
+
+        foreach ($altPath in $alternatePaths) {
+            if (Test-Path $altPath) {
+                $wsusUtilPath = $altPath
+                Write-Log "Found wsusutil.exe at alternate location: $altPath"
+                break
+            }
+        }
+
+        # If still not found, search for it
+        if (-not (Test-Path $wsusUtilPath)) {
+            Write-Log "Searching for wsusutil.exe on C: drive (this may take a minute)..."
+            try {
+                $foundFiles = Get-ChildItem -Path "C:\Program Files" -Recurse -Filter "wsusutil.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($foundFiles) {
+                    $wsusUtilPath = $foundFiles.FullName
+                    Write-Log "Found wsusutil.exe at: $wsusUtilPath"
+                } else {
+                    Write-Log "ERROR: Cannot find wsusutil.exe anywhere on the system"
+                    Write-Log ""
+                    Write-Log "This suggests WSUS binaries were not installed properly."
+                    Write-Log "Possible causes:"
+                    Write-Log "  1. Installation failed silently"
+                    Write-Log "  2. Reboot is required before binaries appear"
+                    Write-Log "  3. Disk space issues"
+                    Write-Log ""
+                    Write-Log "Checking disk space..."
+                    Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+                        Write-Log "  $($_.Name): $([math]::Round($_.Free/1GB,2)) GB free of $([math]::Round(($_.Used+$_.Free)/1GB,2)) GB"
+                    }
+                    Write-Log ""
+                    Write-Log "Manual fix:"
+                    Write-Log "  1. Check if reboot is needed: Get-WindowsFeature UpdateServices*"
+                    Write-Log "  2. Reboot the server if needed"
+                    Write-Log "  3. After reboot, run: wsusutil.exe postinstall CONTENT_DIR=$WSUSContentDir"
+                    throw "wsusutil.exe not found - WSUS installation may be incomplete"
+                }
+            } catch {
+                Write-Log "Error searching for wsusutil.exe: $_"
+                throw "wsusutil.exe not found"
+            }
         }
     }
 

@@ -17,18 +17,46 @@ function Write-Log {
 Write-Log "Starting WSUS Server Setup..."
 
 try {
+    # Check if SQL Server is installed
+    Write-Log "Checking for existing SQL Server installation..."
+    $sqlServerInstalled = $false
+
+    try {
+        $sqlService = Get-Service -Name "MSSQL*" -ErrorAction SilentlyContinue
+        if ($sqlService) {
+            $sqlServerInstalled = $true
+            Write-Log "SQL Server detected on this system."
+        }
+    } catch {
+        Write-Log "No SQL Server detected."
+    }
+
+    # Check for SQL Server Connectivity feature
+    $sqlConnectivity = Get-WindowsFeature -Name "UpdateServices-DB" -ErrorAction SilentlyContinue
+    Write-Log "SQL Server Connectivity feature status: $($sqlConnectivity.Installed)"
+
     # Install WSUS Role with required features
     Write-Log "Installing WSUS Role and features..."
-    $installResult = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
-    Write-Log "UpdateServices installation result: $($installResult.Success)"
 
-    $installResult2 = Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-DB
-    Write-Log "UpdateServices-Services,UpdateServices-DB installation result: $($installResult2.Success)"
+    if ($sqlServerInstalled) {
+        Write-Log "SQL Server detected - installing WSUS without WID to avoid conflict..."
+        # Install only the services and management tools, not the database
+        $installResult = Install-WindowsFeature -Name UpdateServices-Services,UpdateServices-RSAT -IncludeManagementTools
+        Write-Log "UpdateServices-Services installation result: $($installResult.Success)"
+
+        # Note: We'll configure WSUS to use WID via wsusutil parameters
+        Write-Log "Will configure WSUS to use Windows Internal Database (WID) during post-install."
+    } else {
+        Write-Log "No SQL Server conflict detected - installing WSUS with default database..."
+        # Standard installation with WID
+        $installResult = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+        Write-Log "UpdateServices installation result: $($installResult.Success)"
+    }
 
     Write-Log "WSUS Role installed successfully."
 
     # Wait for installation to complete and check if reboot is needed
-    if ($installResult.RestartNeeded -eq 'Yes' -or $installResult2.RestartNeeded -eq 'Yes') {
+    if ($installResult.RestartNeeded -eq 'Yes') {
         Write-Log "WARNING: Reboot may be required after WSUS installation."
     }
 
@@ -73,10 +101,20 @@ try {
 
     # Run WSUS post-installation configuration
     Write-Log "Running WSUS post-installation configuration..."
-    Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir"
 
+    # Build the command based on SQL Server presence
     try {
-        $postInstallOutput = & "$wsusUtilPath" postinstall CONTENT_DIR=$WSUSContentDir 2>&1
+        if ($sqlServerInstalled) {
+            # Use Windows Internal Database explicitly to avoid SQL Server conflict
+            Write-Log "Using Windows Internal Database (WID) due to SQL Server presence"
+            Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir SQLINSTANCE_NAME=##WID"
+            $postInstallOutput = & "$wsusUtilPath" postinstall "CONTENT_DIR=$WSUSContentDir" "SQLINSTANCE_NAME=##WID" 2>&1
+        } else {
+            # Default installation
+            Write-Log "Command: $wsusUtilPath postinstall CONTENT_DIR=$WSUSContentDir"
+            $postInstallOutput = & "$wsusUtilPath" postinstall "CONTENT_DIR=$WSUSContentDir" 2>&1
+        }
+
         Write-Log "Post-install output: $postInstallOutput"
         Write-Log "Waiting 30 seconds for post-install to complete..."
         Start-Sleep -Seconds 30

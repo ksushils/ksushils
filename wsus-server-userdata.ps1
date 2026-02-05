@@ -16,15 +16,23 @@ function Write-Log {
 
 Write-Log "Starting WSUS Server Setup..."
 
-# Import required modules
-Write-Log "Loading ServerManager module..."
+# Try to import ServerManager module if available (optional on Windows Server 2016+)
+Write-Log "Checking for Windows Feature management cmdlets..."
 try {
-    Import-Module ServerManager -ErrorAction Stop
-    Write-Log "ServerManager module loaded successfully."
+    # Try importing ServerManager module (may not exist on all versions)
+    Import-Module ServerManager -ErrorAction SilentlyContinue
+    Write-Log "ServerManager module loaded (if available)."
 } catch {
-    Write-Log "ERROR: Failed to load ServerManager module: $_"
-    throw "ServerManager module is required for WSUS installation"
+    Write-Log "ServerManager module not available - will use built-in cmdlets."
 }
+
+# Verify Get-WindowsFeature cmdlet is available
+if (-not (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Get-WindowsFeature cmdlet is not available on this system."
+    Write-Log "This script requires Windows Server with Windows Feature management cmdlets."
+    throw "Get-WindowsFeature cmdlet not found"
+}
+Write-Log "Windows Feature management cmdlets are available."
 
 try {
     # Check if SQL Server Connectivity feature is already installed

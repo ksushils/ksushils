@@ -72,6 +72,9 @@ try {
     # 4 = Auto download and schedule the install
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "AUOptions" -Value 4 -Type DWord
 
+    # Disable NoAutoUpdate to ensure automatic updates are enabled
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 0 -Type DWord
+
     # Schedule install day (0 = Every day, 1-7 = Sunday-Saturday)
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "ScheduledInstallDay" -Value 0 -Type DWord
 
@@ -119,10 +122,17 @@ try {
     # Write-Log "Clearing SoftwareDistribution folder..."
     # Remove-Item "C:\Windows\SoftwareDistribution\*" -Recurse -Force -ErrorAction SilentlyContinue
 
-    # Start Windows Update service
+    # Set Windows Update service to Automatic and start it
+    Write-Log "Configuring Windows Update service..."
+    Set-Service -Name wuauserv -StartupType Automatic
+
     Write-Log "Starting Windows Update service..."
     Start-Service -Name wuauserv
     Start-Sleep -Seconds 3
+
+    # Verify service is running
+    $serviceStatus = Get-Service -Name wuauserv
+    Write-Log "Windows Update service status: $($serviceStatus.Status), StartType: $($serviceStatus.StartType)"
 
     # Force Windows Update to detect WSUS server
     Write-Log "Forcing Windows Update detection..."

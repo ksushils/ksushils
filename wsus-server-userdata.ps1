@@ -16,6 +16,16 @@ function Write-Log {
 
 Write-Log "Starting WSUS Server Setup..."
 
+# Import required modules
+Write-Log "Loading ServerManager module..."
+try {
+    Import-Module ServerManager -ErrorAction Stop
+    Write-Log "ServerManager module loaded successfully."
+} catch {
+    Write-Log "ERROR: Failed to load ServerManager module: $_"
+    throw "ServerManager module is required for WSUS installation"
+}
+
 try {
     # Check if SQL Server Connectivity feature is already installed
     Write-Log "Checking for SQL Server Connectivity (UpdateServices-DB) feature..."
